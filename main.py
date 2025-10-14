@@ -120,7 +120,7 @@ async def get_dashboard(sesskey, cookie_jar):
             response_obj = json_response[0]
             data = response_obj.get('data', {})
             courses = data.get('courses', [])
-            result = "<b>📚 Курсы FIO:</b>\n"
+            result = "<b>📚 Курсы FIO:</b>\n" #доделать получение ФИО
             for course in courses:
                 result += f"{course.get('fullname')}\n➡️ /course_{course.get('id')}\n\n"
             return result
