@@ -1,25 +1,29 @@
 import aiohttp
 import json
 import re
-import asyncio
 from bs4 import BeautifulSoup
-from urllib.parse import quote
-from telegram import Update
+from telegram import Update,InputFile
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
-from numba import njit
+from io import BytesIO
+from contextlib import suppress
+from playwright.async_api import async_playwright
 
 with open('token.txt') as f:
     BOT_TOKEN = f.read().strip()
 
-@njit
-def get_jhash(code: int) -> int:
-    x = 123456789
-    k = 0
-    for i in range(1677696):
-        x = ((x + code) ^ (x + (x % 3) + (x % 17) + code) ^ i) % 16776960
-        if x % 117 == 0:
-            k = (k + 1) % 1111
-    return k
+async def send_html_chunks(update, text):
+    MAX = 3000
+    safe_points = []
+    for m in re.finditer(r"</b>|<br>|</i>|</u>|</code>", text):
+        safe_points.append(m.end())
+    safe_points.append(len(text))
+    start = 0
+    for p in safe_points:
+        if p - start > MAX:
+            await update.message.reply_text(text[start:p], parse_mode="HTML")
+            start = p
+    if start < len(text):
+        await update.message.reply_text(text[start:], parse_mode="HTML")
 
 async def login_to_moodle(username, password):
     headers = {
@@ -35,41 +39,17 @@ async def login_to_moodle(username, password):
         soup = BeautifulSoup(html, 'html.parser')
         token_input = soup.find('input', {'name': 'logintoken'})
         if not token_input:
-            set_cookies = response.headers.getall("Set-Cookie") if hasattr(response.headers, "getall") else [response.headers.get("Set-Cookie", "")]
-            js_p = None
-            for sc in set_cookies:
-                if "__js_p_" in sc:
-                    js_p = sc.split("__js_p_=")[1].split(";")[0]
-                    break
-            print("js_p =", js_p)
-            code = int(js_p.split(",")[0])
-            jhash = get_jhash(code)
-            print("jhash =", jhash)
-            session.cookie_jar.update_cookies({"__jua_": quote(headers["User-Agent"], safe=""),"__jhash_": str(jhash),})
-            await asyncio.sleep(1)
-            async with session.get(login_url, headers={"Referer": "https://www.google.com/"}, allow_redirects=True) as r2:
-                html2 = await r2.text()
-            soup2 = BeautifulSoup(html2, "html.parser")
-            token_input = soup2.find("input", {"name": "logintoken"})
-            if token_input:
-                pass
-            else:
-                token_input = None
+            return None
         logintoken = token_input.get('value', '')
-        print(logintoken)
         payload = {
             'logintoken': logintoken,
             'username': username,
             'password': password,
             'anchor': ''
         }
-        headers = {
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-        post_headers = {**headers, "Referer": login_url, "Origin": "https://lms.ranepa.ru"}
-        async with session.post(login_url,data=payload,headers=post_headers,allow_redirects=True) as response:
-            print(response.status,response.text)
+        post_headers = {**headers,"Content-Type": "application/x-www-form-urlencoded","Origin": "https://lms.ranepa.ru","Referer": "https://lms.ranepa.ru/login/index.php"}
+        async with session.post(login_url, data=payload, headers=post_headers, allow_redirects=True) as response:
+            final_html = await response.text()
             if response.status == 200:
                 final_html = await response.text()
                 if "Неверный логин или пароль" in final_html:
@@ -139,16 +119,13 @@ async def get_sesskey(cookie_jar):
             return None
 
 async def get_dashboard(sesskey, cookie_jar):
-    url2 = "https://lms.ranepa.ru/my/"
+    url2 = "https://lms.ranepa.ru/grade/report/overview/index.php"
     async with aiohttp.ClientSession(cookie_jar=cookie_jar) as session:
         async with session.post(url2) as response:
             html = await response.text()
             soup = BeautifulSoup(html, 'html.parser')
-            profile_link = soup.find('a', title="Просмотр профиля")
-            if profile_link:
-                fio = profile_link.get_text()
-            else:
-                fio = None
+            page_header = soup.find('h1', class_='h2')
+            fio = page_header.text.strip() if page_header else ""
     url = f"https://lms.ranepa.ru/lib/ajax/service.php?sesskey={sesskey}&info=block_mydashboard_get_enrolled_courses_by_timeline_classification"
     payload = [
         {
@@ -187,7 +164,6 @@ async def get_course(sesskey, cookie_jar,course_id):
                     }
         }
 ]
-    result = ""
     async with aiohttp.ClientSession(cookie_jar=cookie_jar) as session:
         async with session.post(url,json = payload) as response:
             response_text = await response.text()
@@ -195,7 +171,6 @@ async def get_course(sesskey, cookie_jar,course_id):
             response_obj = json_response[0]
             data_str = response_obj.get('data', '{}')
             data = json.loads(data_str)
-            print(data)
             sections = {str(s["id"]): s for s in data.get("section", [])}
             cms = data.get("cm", [])
             cm_by_section = {}
@@ -244,57 +219,164 @@ async def get_course(sesskey, cookie_jar,course_id):
                     sec_id, i, depth = str(cm["delegatesectionid"]), 0, depth + 4
                     continue
                 name = cm.get("name", "без названия")
-                print(cm)
-                emojis = {"attendancernhgs": "💯", "outgrade": "💯", "mtslinkrnhgs": "☎️", "resource": "📄", "workshop": "📤", "vwork": "📝", "quiz": "🧠"}
+                emojis = {"attendancernhgs": "💯", "outgrade": "💯", "mtslinkrnhgs": "☎️", "resource": "📄", "workshop": "📤", "vwork": "📝", "quiz": "🧠", "page":"📜","folder":"📁","video":"🎬", "scorm":"🖥️","label":"🏷️"}
                 emoji = emojis.get(cm.get("module"))
                 indent = "　" * depth
                 lines.append(f'{indent}{emoji} {name}\n/cm_{cm.get('module')}_{cm.get('id')}\n')
 
             return "\n".join(lines)
 
-async def get_cm(sesskey,cm_id,cm_type):
+async def get_cm(cookie_jar,cm_id,cm_type):
     url = f"https://lms.ranepa.ru/mod/{cm_type}/view.php?id={cm_id}"
-    
+    match cm_type:
+        case "resource":
+            async with aiohttp.ClientSession(cookie_jar=cookie_jar) as session:
+                async with session.get(url,allow_redirects=True) as response:
+                    data = await response.read()
+                    bio = BytesIO(data)
+                    bio.name = response.url.name
+                    return {"type": "file","file":InputFile(bio)}
+        case "outgrade":
+            async with aiohttp.ClientSession(cookie_jar=cookie_jar) as session:
+                async with session.get(url) as resp:
+                    html = await resp.text()
+            soup = BeautifulSoup(html, "html.parser")
+            main = soup.select_one("#region-main") or soup
+            title_el = soup.select_one("h1.h2.mb-0")
+            title = title_el.get_text(strip=True) if title_el else "Без названия"
+            grade_cell = main.select_one("td.cell.c0")
+            if grade_cell:
+                grade = grade_cell.get_text(strip=True)
+                comment_cell = main.select_one("td.cell.c1")
+                comment = comment_cell.get_text(strip=True) if comment_cell else ""
+                date = main.select_one("td.cell.c2").get_text(strip=True)
+                teacher = main.select_one("td.cell.c3").get_text(strip=True)
+                parts = [f"📘 {title}",f"✅ Оценка: {grade}"]
+                if comment:
+                    parts.append(f"💬 Комментарий: {comment}")
+                parts += [f"📅 Дата: {date}",f"👩‍🏫 Преподаватель: {teacher}"]
+                text = "\n".join(parts)
+                return {"type": "text", "text": text}
+            alert = main.select_one(".mod_outgrade .alert")
+            if alert:
+                alert_text = alert.get_text(strip=True)
+                desc_el = main.select_one(".mod_outgrade .generalbox .no-overflow p")
+                desc = desc_el.get_text(strip=True) if desc_el else None
+                if desc:
+                    text = f"📘 {title}\n📝 {desc}\nℹ️ {alert_text}"
+                else:
+                    text = f"📘 {title}\nℹ️ {alert_text}"
+                return {"type": "text", "text": text}
+            return {"type": "text", "text": f"Не удалось определить состояние оценки ({title})"}
+        case "attendancernhgs":
+            url = f"https://lms.ranepa.ru/mod/attendancernhgs/manage.php?id={cm_id}&brspage=brs"
+            async with aiohttp.ClientSession(cookie_jar=cookie_jar) as session:
+                async with session.get(url) as resp:
+                    html = await resp.text()
+            async with async_playwright() as p:
+                browser = await p.chromium.launch()
+                page = await browser.new_page()
+                await page.set_content(html, wait_until="networkidle")
+                png_bytes = await page.screenshot(full_page=True)
+                await browser.close()
+                png = png_bytes
+            bio = BytesIO(png)
+            bio.name = "page.png"
+            soup = BeautifulSoup(html, "html.parser")
+            hidden = soup.select(".folded")
+            kt_titles = []
+            kt_scores = []
+            db_titles = []
+            db_scores = []
+            for el in hidden:
+                pid = el.get("parentid")
+                text = el.get_text(strip=True)
+                if pid == "ktpoints":
+                    if el.name == "th":
+                        kt_titles.append(text)
+                    elif el.name == "td":
+                        kt_scores.append(text)
+                elif pid == "db":
+                    if el.name == "th":
+                        db_titles.append(text)
+                    elif el.name == "td":
+                        db_scores.append(text)
+            msg = "Контрольные точки:\n"
+            for t, s in zip(kt_titles, kt_scores):
+                msg += f"- {t} - {s}\n"
+            msg += "\nДополнительные баллы:\n"
+            for t, s in zip(db_titles, db_scores):
+                msg += f"- {t} - {s}\n"
+            return {"type": "photo+message", "photo": InputFile(bio),"message":msg}
+        case "workshop" | "quiz" | "page" | "vwork" | "folder" | "video":
+            async with aiohttp.ClientSession(cookie_jar=cookie_jar) as session:
+                async with session.get(url) as resp:
+                    html = await resp.text()
+            async with async_playwright() as p:
+                browser = await p.chromium.launch()
+                page = await browser.new_page()
+                await page.set_content(html, wait_until="networkidle")
+                png_bytes = await page.screenshot(full_page=True)
+                await browser.close()
+                png = png_bytes
+            bio = BytesIO(png)
+            bio.name = "page.png"
+            return {"type": "photo", "photo": InputFile(bio)}
+        case _:
+            return {"type":None,"text":f'Неверный формат команды или элемент "{cm_type}" не поддерживается'}
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Используй /grades для получения оценок\nИспользуй /dashboard для получения дашборда")
 
 async def grades_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Получаю оценки...")
-    with open('credentials.json') as f:
-        username, password = json.load(f)["1"].split(';')
-    cookie_jar = await login_to_moodle(username, password)
-    if cookie_jar:
-        grades = await get_grades(cookie_jar)
-        await update.message.reply_text(grades,parse_mode='HTML')
-    else:
-        await update.message.reply_text("Ошибка авторизации")
+    status = await update.message.reply_text("Получаю оценки...")
+    try:
+        with open('credentials.json') as f:
+            username, password = json.load(f)["1"].split(';')
+        cookie_jar = await login_to_moodle(username, password)
+        if cookie_jar:
+            grades = await get_grades(cookie_jar)
+            await update.message.reply_text(grades,parse_mode='HTML')
+        else:
+            await update.message.reply_text("Ошибка авторизации")
+    finally:
+            with suppress(Exception):
+                await status.delete()
 
 async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Получаю дашборд...")
-    with open('credentials.json') as f:
-        username, password = json.load(f)["1"].split(';')
-    cookie_jar = await login_to_moodle(username, password)
-    if cookie_jar:
-        sesskey = await get_sesskey(cookie_jar)
-        result = await get_dashboard(sesskey,cookie_jar)
-        await update.message.reply_text(result,parse_mode='HTML')
-    else:
-        await update.message.reply_text("Ошибка авторизации")
-
-async def open_course(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    match = re.match(r"^/course_(\d+)$", update.message.text)
-    if match:
-        course_id = match.group(1)
-        await update.message.reply_text("Получаю курс...")
+    status = await update.message.reply_text("Получаю дашборд...")
+    try:
         with open('credentials.json') as f:
             username, password = json.load(f)["1"].split(';')
         cookie_jar = await login_to_moodle(username, password)
         if cookie_jar:
             sesskey = await get_sesskey(cookie_jar)
-            result = await get_course(sesskey,cookie_jar,course_id)
+            result = await get_dashboard(sesskey,cookie_jar)
             await update.message.reply_text(result,parse_mode='HTML')
         else:
             await update.message.reply_text("Ошибка авторизации")
+    finally:
+            with suppress(Exception):
+                await status.delete()
+
+async def open_course(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    match = re.match(r"^/course_(\d+)$", update.message.text)
+    if match:
+        course_id = match.group(1)
+        status = await update.message.reply_text("Получаю курс...")
+        try:
+            with open('credentials.json') as f:
+                username, password = json.load(f)["1"].split(';')
+            cookie_jar = await login_to_moodle(username, password)
+            if cookie_jar:
+                sesskey = await get_sesskey(cookie_jar)
+                result = await get_course(sesskey,cookie_jar,course_id)
+                await send_html_chunks(update, result)
+            else:
+                await update.message.reply_text("Ошибка авторизации")
+        finally:
+            with suppress(Exception):
+                await status.delete()
     else:
         await update.message.reply_text("Неверный формат команды")
 
@@ -303,12 +385,26 @@ async def open_cm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if match:
         cm_type = match.group(1)
         cm_id = match.group(2)
-        await update.message.reply_text("Получаю элемент курса...")
-        with open('credentials.json') as f:
-            username, password = json.load(f)["1"].split(';')
-        cookie_jar = await login_to_moodle(username, password)
-        if cookie_jar:
-            result = await get_cm(cookie_jar,cm_type,cm_id)
+        status = await update.message.reply_text("Получаю элемент курса...")
+        try:    
+            with open('credentials.json') as f:
+                username, password = json.load(f)["1"].split(';')
+            cookie_jar = await login_to_moodle(username, password)
+            if cookie_jar:
+                result = await get_cm(cookie_jar,cm_id,cm_type)
+                if result.get("type") == "file":
+                    await update.message.reply_document(document=result.get("file"))
+                elif result.get("type") == "photo":
+                    await update.message.reply_photo(photo=result.get("photo"))
+                elif result.get("type") == "photo+message":
+                    await update.message.reply_photo(photo=result.get("photo"), caption = result.get("message"))
+                else:
+                    await update.message.reply_text(result.get("text"))
+            else:
+                await update.message.reply_text("Ошибка авторизации")
+        finally:
+            with suppress(Exception):
+                await status.delete()
     else:
         await update.message.reply_text("Неверный формат команды")
 
