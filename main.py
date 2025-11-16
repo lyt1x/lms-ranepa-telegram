@@ -7,6 +7,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 from io import BytesIO
 from contextlib import suppress
 from playwright.async_api import async_playwright
+import sqlite3
 
 with open('token.txt') as f:
     BOT_TOKEN = f.read().strip()
@@ -25,7 +26,7 @@ async def send_html_chunks(update, text):
     if start < len(text):
         await update.message.reply_text(text[start:], parse_mode="HTML")
 
-async def login_to_moodle(username, password):
+async def login_to_moodle(username, password, user_id):
     headers = {
         "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                        "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -55,7 +56,13 @@ async def login_to_moodle(username, password):
                 if "Неверный логин или пароль" in final_html:
                     return None
                 else:
-                    return session.cookie_jar
+                    cookies_dict = {c.key: c.value for c in session.cookie_jar}
+                    cookies_json = json.dumps(cookies_dict)
+                    conn = sqlite3.connect("sessions.db")
+                    cursor = conn.cursor()
+                    cursor.execute("""INSERT INTO sessions (user_id, cookie_jar)VALUES (?, ?)ON CONFLICT(user_id) DO UPDATE SET cookie_jar = excluded.cookie_jar;""", (user_id, cookies_json))
+                    conn.commit()
+                    conn.close()
             else:
                 return None
 
@@ -65,6 +72,8 @@ async def get_grades(cookie_jar):
             "https://lms.ranepa.ru/grade/report/overview/index.php",
             headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         ) as response:
+            if "login/index.php" in str(response.url):
+                return "Время вашего сеанса истекло. Пожалуйста, войдите снова."
             content = await response.text()
             soup = BeautifulSoup(content, 'html.parser')
             page_header = soup.find('h1', class_='h2')
@@ -82,20 +91,20 @@ async def get_grades(cookie_jar):
                     course_name_elem = cells[0].find('a')
                     course_name = course_name_elem.text.strip() if course_name_elem else cells[0].text.strip()
                     grade = cells[1].text.strip()
-                    emoji = "✅" if grade != '-' else "⏳"
+                    emoji = "⏳" if grade == '-' else "⭐"
                     grade_display = f"{grade}" if grade != '-' else "ожидается"
-                    if len(course_name) > 50:
-                        course_name = course_name[:47] + "..."
+                    if len(course_name) > 60:
+                        course_name = course_name[:57] + "..."
                     
-                    courses.append(f"{emoji} {course_name}\n⭐ {grade_display}")
+                    courses.append(f"\n<b>{course_name}</b>\n{emoji} {grade_display}")
             if not courses:
                 return "📭 Нет доступных курсов с оценками"
-            result = [f"<b>📊 Оценки {fio}:</b>\n"]
+            result = [f"<b>📊 Оценки {fio}:</b>"]
             result.extend(courses)
             result.append(f"\n📈 <b>Всего курсов:</b> {len(courses)}")
             return "\n".join(result)
 
-async def get_sesskey(cookie_jar):
+async def get_sesskey(cookie_jar,user_id):
     url = 'https://lms.ranepa.ru/my/'
     async with aiohttp.ClientSession(cookie_jar=cookie_jar) as session:
         async with session.get(url) as response:
@@ -113,7 +122,11 @@ async def get_sesskey(cookie_jar):
                             try:
                                 config = json.loads(json_str)
                                 sesskey = config.get('sesskey')
-                                return sesskey
+                                conn = sqlite3.connect("sessions.db")
+                                cursor = conn.cursor()
+                                cursor.execute("""INSERT INTO sessions (user_id, sesskey)VALUES (?, ?)ON CONFLICT(user_id) DO UPDATE SET sesskey = excluded.sesskey;""", (user_id, sesskey))
+                                conn.commit()
+                                conn.close()
                             except json.JSONDecodeError:
                                 pass
             return None
@@ -122,6 +135,8 @@ async def get_dashboard(sesskey, cookie_jar):
     url2 = "https://lms.ranepa.ru/grade/report/overview/index.php"
     async with aiohttp.ClientSession(cookie_jar=cookie_jar) as session:
         async with session.post(url2) as response:
+            if "login/index.php" in str(response.url):
+                return "Время вашего сеанса истекло. Пожалуйста, войдите снова."
             html = await response.text()
             soup = BeautifulSoup(html, 'html.parser')
             page_header = soup.find('h1', class_='h2')
@@ -169,6 +184,12 @@ async def get_course(sesskey, cookie_jar,course_id):
             response_text = await response.text()
             json_response = json.loads(response_text)
             response_obj = json_response[0]
+            if response_obj.get("error") and response_obj["exception"]["errorcode"] in (
+                "servicerequireslogin",
+                "requireloginerror",
+                "invalidsesskey"
+            ):
+                return "Время вашего сеанса истекло. Пожалуйста, войдите снова."
             data_str = response_obj.get('data', '{}')
             data = json.loads(data_str)
             sections = {str(s["id"]): s for s in data.get("section", [])}
@@ -232,6 +253,8 @@ async def get_cm(cookie_jar,cm_id,cm_type):
         case "resource":
             async with aiohttp.ClientSession(cookie_jar=cookie_jar) as session:
                 async with session.get(url,allow_redirects=True) as response:
+                    if "login/index.php" in str(response.url):
+                        return {"type": "error", "text": "Время вашего сеанса истекло. Пожалуйста, войдите снова."}
                     data = await response.read()
                     bio = BytesIO(data)
                     bio.name = response.url.name
@@ -239,6 +262,8 @@ async def get_cm(cookie_jar,cm_id,cm_type):
         case "outgrade":
             async with aiohttp.ClientSession(cookie_jar=cookie_jar) as session:
                 async with session.get(url) as resp:
+                    if "login/index.php" in str(resp.url):
+                        return {"type": "error", "text": "Время вашего сеанса истекло. Пожалуйста, войдите снова."}
                     html = await resp.text()
             soup = BeautifulSoup(html, "html.parser")
             main = soup.select_one("#region-main") or soup
@@ -272,6 +297,8 @@ async def get_cm(cookie_jar,cm_id,cm_type):
             url = f"https://lms.ranepa.ru/mod/attendancernhgs/manage.php?id={cm_id}&brspage=brs"
             async with aiohttp.ClientSession(cookie_jar=cookie_jar) as session:
                 async with session.get(url) as resp:
+                    if "login/index.php" in str(resp.url):
+                        return {"type": "error", "text": "Время вашего сеанса истекло. Пожалуйста, войдите снова."}
                     html = await resp.text()
             async with async_playwright() as p:
                 browser = await p.chromium.launch()
@@ -311,6 +338,8 @@ async def get_cm(cookie_jar,cm_id,cm_type):
         case "workshop" | "quiz" | "page" | "vwork" | "folder" | "video":
             async with aiohttp.ClientSession(cookie_jar=cookie_jar) as session:
                 async with session.get(url) as resp:
+                    if "login/index.php" in str(resp.url):
+                        return {"type": "error", "text": "Время вашего сеанса истекло. Пожалуйста, войдите снова."}
                     html = await resp.text()
             async with async_playwright() as p:
                 browser = await p.chromium.launch()
@@ -328,17 +357,58 @@ async def get_cm(cookie_jar,cm_id,cm_type):
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Используй /grades для получения оценок\nИспользуй /dashboard для получения дашборда")
 
+async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    status = await update.message.reply_text("Авторизируюсь в аккаунт...")
+    try:
+        user_id = update.effective_user.id
+        with open('credentials.json') as f:
+            username, password = json.load(f)[str(user_id)].split(';')
+        await login_to_moodle(username,password,user_id)
+        conn = sqlite3.connect("sessions.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT cookie_jar FROM sessions WHERE user_id=?", (user_id,))
+        row = cursor.fetchone()
+        conn.close()
+        if not row:
+            await update.message.reply_text("Ошибка авторизации")
+            return
+        cookies_json = row[0]
+        cookies = json.loads(cookies_json)
+        cookie_jar = aiohttp.CookieJar()
+        cookie_jar.update_cookies(cookies)
+        await get_sesskey(cookie_jar,user_id)
+        conn = sqlite3.connect("sessions.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT sesskey FROM sessions WHERE user_id=?", (user_id,))
+        row = cursor.fetchone()
+        conn.close()
+        if not row:
+            await update.message.reply_text("Ошибка авторизации")
+            return
+        else:
+            await update.message.reply_text(f"Успешная авторизация в аккаунт <b>{username}</b>",parse_mode='HTML')
+    finally:
+        with suppress(Exception):
+            await status.delete()
+
 async def grades_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = await update.message.reply_text("Получаю оценки...")
     try:
-        with open('credentials.json') as f:
-            username, password = json.load(f)["1"].split(';')
-        cookie_jar = await login_to_moodle(username, password)
-        if cookie_jar:
-            grades = await get_grades(cookie_jar)
-            await update.message.reply_text(grades,parse_mode='HTML')
-        else:
-            await update.message.reply_text("Ошибка авторизации")
+        user_id = update.effective_user.id
+        conn = sqlite3.connect("sessions.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT cookie_jar FROM sessions WHERE user_id=?", (user_id,))
+        row = cursor.fetchone()
+        conn.close()
+        if not row:
+            await update.message.reply_text("Для использования этой команды нужно сначала войти в аккаунт /login")
+            return
+        cookies_json = row[0]
+        cookies = json.loads(cookies_json)
+        cookie_jar = aiohttp.CookieJar()
+        cookie_jar.update_cookies(cookies)
+        grades = await get_grades(cookie_jar)
+        await update.message.reply_text(grades,parse_mode='HTML')
     finally:
             with suppress(Exception):
                 await status.delete()
@@ -346,15 +416,21 @@ async def grades_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = await update.message.reply_text("Получаю дашборд...")
     try:
-        with open('credentials.json') as f:
-            username, password = json.load(f)["1"].split(';')
-        cookie_jar = await login_to_moodle(username, password)
-        if cookie_jar:
-            sesskey = await get_sesskey(cookie_jar)
-            result = await get_dashboard(sesskey,cookie_jar)
-            await update.message.reply_text(result,parse_mode='HTML')
-        else:
-            await update.message.reply_text("Ошибка авторизации")
+        user_id = update.effective_user.id
+        conn = sqlite3.connect("sessions.db")
+        cursor = conn.cursor()
+        cursor.execute("SELECT sesskey, cookie_jar FROM sessions WHERE user_id=?", (user_id,))
+        row = cursor.fetchone()
+        conn.close()
+        if not row:
+            await update.message.reply_text("Для использования этой команды нужно сначала войти в аккаунт /login")
+            return
+        sesskey, cookies_json = row
+        cookies = json.loads(cookies_json)
+        cookie_jar = aiohttp.CookieJar()
+        cookie_jar.update_cookies(cookies)
+        result = await get_dashboard(sesskey,cookie_jar)
+        await update.message.reply_text(result,parse_mode='HTML')
     finally:
             with suppress(Exception):
                 await status.delete()
@@ -365,15 +441,21 @@ async def open_course(update: Update, context: ContextTypes.DEFAULT_TYPE):
         course_id = match.group(1)
         status = await update.message.reply_text("Получаю курс...")
         try:
-            with open('credentials.json') as f:
-                username, password = json.load(f)["1"].split(';')
-            cookie_jar = await login_to_moodle(username, password)
-            if cookie_jar:
-                sesskey = await get_sesskey(cookie_jar)
-                result = await get_course(sesskey,cookie_jar,course_id)
-                await send_html_chunks(update, result)
-            else:
-                await update.message.reply_text("Ошибка авторизации")
+            user_id = update.effective_user.id
+            conn = sqlite3.connect("sessions.db")
+            cursor = conn.cursor()
+            cursor.execute("SELECT sesskey, cookie_jar FROM sessions WHERE user_id=?", (user_id,))
+            row = cursor.fetchone()
+            conn.close()
+            if not row:
+                await update.message.reply_text("Для использования этой команды нужно сначала войти в аккаунт /login")
+                return
+            sesskey, cookies_json = row
+            cookies = json.loads(cookies_json)
+            cookie_jar = aiohttp.CookieJar()
+            cookie_jar.update_cookies(cookies)
+            result = await get_course(sesskey,cookie_jar,course_id)
+            await send_html_chunks(update, result)
         finally:
             with suppress(Exception):
                 await status.delete()
@@ -386,22 +468,29 @@ async def open_cm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cm_type = match.group(1)
         cm_id = match.group(2)
         status = await update.message.reply_text("Получаю элемент курса...")
-        try:    
-            with open('credentials.json') as f:
-                username, password = json.load(f)["1"].split(';')
-            cookie_jar = await login_to_moodle(username, password)
-            if cookie_jar:
-                result = await get_cm(cookie_jar,cm_id,cm_type)
-                if result.get("type") == "file":
-                    await update.message.reply_document(document=result.get("file"))
-                elif result.get("type") == "photo":
-                    await update.message.reply_photo(photo=result.get("photo"))
-                elif result.get("type") == "photo+message":
-                    await update.message.reply_photo(photo=result.get("photo"), caption = result.get("message"))
-                else:
-                    await update.message.reply_text(result.get("text"))
+        try:
+            user_id = update.effective_user.id
+            conn = sqlite3.connect("sessions.db")
+            cursor = conn.cursor()
+            cursor.execute("SELECT cookie_jar FROM sessions WHERE user_id=?", (user_id,))
+            row = cursor.fetchone()
+            conn.close()
+            if not row:
+                await update.message.reply_text("Для использования этой команды нужно сначала войти в аккаунт /login")
+                return
+            cookies_json = row[0]
+            cookies = json.loads(cookies_json)
+            cookie_jar = aiohttp.CookieJar()
+            cookie_jar.update_cookies(cookies)
+            result = await get_cm(cookie_jar,cm_id,cm_type)
+            if result.get("type") == "file":
+                await update.message.reply_document(document=result.get("file"))
+            elif result.get("type") == "photo":
+                await update.message.reply_photo(photo=result.get("photo"))
+            elif result.get("type") == "photo+message":
+                await update.message.reply_photo(photo=result.get("photo"), caption = result.get("message"))
             else:
-                await update.message.reply_text("Ошибка авторизации")
+                await update.message.reply_text(result.get("text"))
         finally:
             with suppress(Exception):
                 await status.delete()
@@ -413,6 +502,7 @@ def main():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("grades", grades_command))
     app.add_handler(CommandHandler("dashboard",dashboard_command))
+    app.add_handler(CommandHandler("login",login_command))
     app.add_handler(MessageHandler(filters.Regex(r"^/course_\d+$"), open_course))
     app.add_handler(MessageHandler(filters.Regex(r"^/cm_[a-zA-Z]+_\d+$"), open_cm))
     app.run_polling()
