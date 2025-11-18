@@ -169,6 +169,15 @@ async def get_dashboard(sesskey, cookie_jar):
             return result
 
 async def get_course(sesskey, cookie_jar,course_id):
+    url = f"https://lms.ranepa.ru/course/view.php?id={course_id}"
+    async with aiohttp.ClientSession(cookie_jar=cookie_jar) as session:
+        async with session.get(url) as resp:
+            if "login/index.php" in str(resp.url):
+                return None
+            html = await resp.text()
+    soup = BeautifulSoup(html, "html.parser")
+    title_el = soup.select_one("h1.h2.mb-0")
+    title = title_el.get_text(strip=True) if title_el else "Без названия"
     url = f"https://lms.ranepa.ru/lib/ajax/service.php?sesskey={sesskey}&info=core_courseformat_get_state"
     payload = [
         {
@@ -198,6 +207,7 @@ async def get_course(sesskey, cookie_jar,course_id):
             for cm in cms:
                 cm_by_section.setdefault(str(cm.get("sectionid")), []).append(cm)
             lines = []
+            lines.append(f'<b>📗 Курс "{title}"</b>\n')
             stack = []
             sec_order = [str(x) for x in data.get("course", {}).get("sectionlist", [])]
             sec_order = [sid for sid in sec_order if sections.get(sid, {}).get("component") != "mod_subsection"]
@@ -219,10 +229,7 @@ async def get_course(sesskey, cookie_jar,course_id):
                     is_sub = (sec.get("component") == "mod_subsection")
                     indent = "　" * depth
                     icon = "↳ " if is_sub else ""
-                    if sec_idx == 0:
-                        lines.append(f'<b>📗 Курс "{title}"</b>\n')
-                    else:
-                        lines.append(f'{indent}{icon}<b>{title}</b>\n')
+                    lines.append(f'{indent}{icon}<b>{title}</b>\n')
                 sec_cms = cm_by_section.get(sec_id, [])
                 if i >= len(sec_cms):
                     if stack:
@@ -355,7 +362,7 @@ async def get_cm(cookie_jar,cm_id,cm_type):
             return {"type":None,"text":f'Неверный формат команды или элемент "{cm_type}" не поддерживается'}
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Используй /grades для получения оценок\nИспользуй /dashboard для получения дашборда")
+    await update.message.reply_text("Используйте /login для входа в аккаунт\nИспользуйте /grades для получения оценок\nИспользуйте /dashboard для получения дашборда")
 
 async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = await update.message.reply_text("Авторизируюсь в аккаунт...")
