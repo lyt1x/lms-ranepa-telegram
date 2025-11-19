@@ -8,9 +8,11 @@ from io import BytesIO
 from contextlib import suppress
 from playwright.async_api import async_playwright
 import sqlite3
+from dotenv import load_dotenv
+import os
 
-with open('token.txt') as f:
-    BOT_TOKEN = f.read().strip()
+load_dotenv()
+BOT_TOKEN = os.getenv("TOKEN")
 
 async def send_html_chunks(update, text):
     MAX = 3000
