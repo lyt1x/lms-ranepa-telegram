@@ -14,6 +14,22 @@ import os
 load_dotenv()
 BOT_TOKEN = os.getenv("TOKEN")
 
+playwright = None
+browser = None
+
+async def init_playwright(app):
+    global playwright, browser
+    playwright = await async_playwright().start()
+    browser = await playwright.chromium.launch(headless=True)
+
+async def screenshot_html(html: str):
+    page = await browser.new_page()
+    await page.set_content(html, wait_until="networkidle")
+    await page.set_viewport_size({"width": 1280, "height": 900})
+    png = await page.screenshot(full_page=True)
+    await page.close()
+    return png
+
 async def send_html_chunks(update, text):
     MAX = 3000
     safe_points = []
@@ -52,7 +68,6 @@ async def login_to_moodle(username, password, user_id):
         }
         post_headers = {**headers,"Content-Type": "application/x-www-form-urlencoded","Origin": "https://lms.ranepa.ru","Referer": "https://lms.ranepa.ru/login/index.php"}
         async with session.post(login_url, data=payload, headers=post_headers, allow_redirects=True) as response:
-            final_html = await response.text()
             if response.status == 200:
                 final_html = await response.text()
                 if "Неверный логин или пароль" in final_html:
@@ -161,7 +176,12 @@ async def get_dashboard(sesskey, cookie_jar):
     async with aiohttp.ClientSession(cookie_jar=cookie_jar) as session:
         async with session.post(url,json = payload) as response:
             response_text = await response.text()
-            json_response = json.loads(response_text)
+            try:
+                json_response = json.loads(response_text)
+            except:
+                return "Произошла ошибка при получении данных"
+            if not isinstance(json_response, list) or not json_response:
+                return "Произошла ошибка при получении данных"
             response_obj = json_response[0]
             data = response_obj.get('data', {})
             courses = data.get('courses', [])
@@ -309,13 +329,11 @@ async def get_cm(cookie_jar,cm_id,cm_type):
                     if "login/index.php" in str(resp.url):
                         return {"type": "error", "text": "Время вашего сеанса истекло. Пожалуйста, войдите снова."}
                     html = await resp.text()
-            async with async_playwright() as p:
-                browser = await p.chromium.launch()
-                page = await browser.new_page()
-                await page.set_content(html, wait_until="networkidle")
-                png_bytes = await page.screenshot(full_page=True)
-                await browser.close()
-                png = png_bytes
+            try:
+                png_bytes = await screenshot_html(html)
+            except:
+                return {"type": "error", "text": "Ошибка рендера"}
+            png = png_bytes
             bio = BytesIO(png)
             bio.name = "page.png"
             soup = BeautifulSoup(html, "html.parser")
@@ -350,13 +368,11 @@ async def get_cm(cookie_jar,cm_id,cm_type):
                     if "login/index.php" in str(resp.url):
                         return {"type": "error", "text": "Время вашего сеанса истекло. Пожалуйста, войдите снова."}
                     html = await resp.text()
-            async with async_playwright() as p:
-                browser = await p.chromium.launch()
-                page = await browser.new_page()
-                await page.set_content(html, wait_until="networkidle")
-                png_bytes = await page.screenshot(full_page=True)
-                await browser.close()
-                png = png_bytes
+            try:
+                png_bytes = await screenshot_html(html)
+            except:
+                return {"type": "error", "text": "Ошибка рендера"}
+            png = png_bytes
             bio = BytesIO(png)
             bio.name = "page.png"
             return {"type": "photo", "photo": InputFile(bio)}
@@ -507,7 +523,7 @@ async def open_cm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Неверный формат команды")
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(init_playwright).build()
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("grades", grades_command))
     app.add_handler(CommandHandler("dashboard",dashboard_command))
